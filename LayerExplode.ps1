@@ -1,11 +1,11 @@
-﻿# LayerExplode v1.1.0
+﻿# LayerExplode v1.1.1
 # Runs on Windows PowerShell 5.1 / Windows 10-11; no external dependencies.
 param(
     [string]$InputDir
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version = 'v1.1.0'
+$script:Version = 'v1.1.1'
 $script:OutputName = 'Exploded_Layers.png'
 $script:ManifestName = 'Layers.txt'
 $script:CanvasWidth = 3840
@@ -394,7 +394,7 @@ function Render-Composition {
         [object[]]$Layers,
         [int]$MainIndex,
         [double]$AspectRatio,
-        [string]$Folder
+        [string]$OutputFolder
     )
     $W = [int]$script:CanvasWidth
     $H = [int]$script:CanvasHeight
@@ -456,8 +456,10 @@ function Render-Composition {
     $edgePen = $null
     $topEdgePen = $null
     $format = $null
-    $tempPath = Join-Path $Folder 'Exploded_Layers.__writing__.png'
-    $finalPath = Join-Path $Folder $script:OutputName
+    # Rendering is independent of the input image folder.
+    # Default input 'i' exports beside the scripts; external input exports in-place.
+    $tempPath = Join-Path $OutputFolder 'Exploded_Layers.__writing__.png'
+    $finalPath = Join-Path $OutputFolder $script:OutputName
 
     try {
         $bitmap = [System.Drawing.Bitmap]::new($W, $H, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
@@ -586,6 +588,19 @@ try {
     }
     Write-Host "素材目录：$folder"
 
+    # Keep input routing and output routing separate. Check the actual selected
+    # directory, so drag-dropping 'i' also gets the expected main-folder output.
+    $defaultInputPath = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'i')).TrimEnd([char[]]@('\', '/'))
+    $selectedInputPath = [System.IO.Path]::GetFullPath($folder).TrimEnd([char[]]@('\', '/'))
+    $isDefaultInput = [string]::Equals($selectedInputPath, $defaultInputPath, [System.StringComparison]::OrdinalIgnoreCase)
+    if ($isDefaultInput) {
+        $outputFolder = $PSScriptRoot
+    }
+    else {
+        $outputFolder = $folder
+    }
+    Write-Host "成品目录：$outputFolder" -ForegroundColor Cyan
+
     $manifestPath = Join-Path $folder $script:ManifestName
     $newManifest = Ensure-Manifest -Folder $folder
     if ($newManifest) {
@@ -610,7 +625,7 @@ try {
     $mainIndex = [int]$parsed.MainIndex
     $baseInfo = Inspect-Layers -Layers $layers -MainIndex $mainIndex
     Write-Host ("读取完成：{0} 层；主图层：{1}（{2}×{3}，作为基准比例）" -f $layers.Count, $baseInfo.BaseFileName, $baseInfo.BaseWidth, $baseInfo.BaseHeight)
-    Render-Composition -Layers $layers -MainIndex $mainIndex -AspectRatio $baseInfo.BaseAspect -Folder $folder
+    Render-Composition -Layers $layers -MainIndex $mainIndex -AspectRatio $baseInfo.BaseAspect -OutputFolder $outputFolder
     exit 0
 }
 catch {
