@@ -1,11 +1,11 @@
-﻿# LayerExplode v0.0.1
+﻿# LayerExplode v0.0.2
 # Runs on Windows PowerShell 5.1 / Windows 10-11; no external dependencies.
 param(
     [string]$InputDir
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version = 'v0.0.1'
+$script:Version = 'v0.0.2'
 $script:OutputName = 'Exploded_Layers.png'
 $script:ManifestName = 'Layers.txt'
 $script:CanvasWidth = 3840
@@ -51,7 +51,7 @@ function Ensure-Manifest {
     }
 
     $lines = New-Object 'System.Collections.Generic.List[string]'
-    $lines.Add('# 从上到下排列 = 图层从上到下；最后一行 = 不透明的正面海报')
+    $lines.Add('# 从上到下排列 = 图层从上到下；最后一行 = 作为基准比例与底图的正面海报')
     $lines.Add('# 格式：图片文件名 | 左侧标签。可只写文件名（自动取文件名作为标签）。')
     foreach ($file in $files) {
         $label = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
@@ -61,7 +61,7 @@ function Ensure-Manifest {
     [System.IO.File]::WriteAllLines($manifest, [string[]]$lines.ToArray(), $utf8bom)
     Write-Host ''
     Write-Host '首次运行：已创建 Layers.txt，并将在记事本中打开。' -ForegroundColor Cyan
-    Write-Host '请将最后一行调整为正面海报（底图），保存后重新运行 Main.bat。'
+    Write-Host '请把最后一行调整为正面海报（底图）；上层截图尺寸不必一致，程序会按底图比例居中裁切。'
     Write-Host "配置文件：$manifest"
     try {
         Start-Process -FilePath 'notepad.exe' -ArgumentList ('"{0}"' -f $manifest) | Out-Null
@@ -136,27 +136,59 @@ function Inspect-Layers {
     param([object[]]$Layers)
     Add-Type -AssemblyName System.Drawing
 
-    # All full-canvas exports must have the same aspect ratio; resolution may vary.
-    $referenceRatio = 0.0
     foreach ($layer in $Layers) {
         $image = $null
         try {
             $image = [System.Drawing.Image]::FromFile($layer.FilePath)
             $layer.Width = $image.Width
             $layer.Height = $image.Height
-            $ratio = [double]$image.Width / [double]$image.Height
-            if ($referenceRatio -eq 0.0) {
-                $referenceRatio = $ratio
-            }
-            elseif ([Math]::Abs(($ratio / $referenceRatio) - 1.0) -gt 0.015) {
-                throw ('画面比例不一致：{0} ({1}×{2})。请从相同画板导出完整画布。' -f $layer.FileName, $layer.Width, $layer.Height)
+            if ($layer.Width -le 0 -or $layer.Height -le 0) {
+                throw "图片尺寸异常：$($layer.FileName)"
             }
         }
         finally {
             if ($null -ne $image) { $image.Dispose() }
         }
     }
-    return $referenceRatio
+
+    $base = $Layers[-1]
+    $aspect = [double]$base.Width / [double]$base.Height
+    if ($aspect -le 0.0) {
+        throw "底图比例异常：$($base.FileName)"
+    }
+
+    return [pscustomobject]@{
+        BaseFileName = $base.FileName
+        BaseWidth = $base.Width
+        BaseHeight = $base.Height
+        BaseAspect = $aspect
+    }
+}
+
+function Get-CoverSourceRect {
+    param(
+        [int]$ImageWidth,
+        [int]$ImageHeight,
+        [double]$TargetAspect
+    )
+
+    $imageAspect = [double]$ImageWidth / [double]$ImageHeight
+    if ([Math]::Abs($imageAspect - $TargetAspect) -lt 0.000001) {
+        return [System.Drawing.RectangleF]::new(0.0, 0.0, [single]$ImageWidth, [single]$ImageHeight)
+    }
+
+    if ($imageAspect -gt $TargetAspect) {
+        # Too wide: crop left and right.
+        $cropWidth = [double]$ImageHeight * $TargetAspect
+        $cropX = ([double]$ImageWidth - $cropWidth) / 2.0
+        return [System.Drawing.RectangleF]::new([single]$cropX, 0.0, [single]$cropWidth, [single]$ImageHeight)
+    }
+    else {
+        # Too tall: crop top and bottom.
+        $cropHeight = [double]$ImageWidth / $TargetAspect
+        $cropY = ([double]$ImageHeight - $cropHeight) / 2.0
+        return [System.Drawing.RectangleF]::new(0.0, [single]$cropY, [single]$ImageWidth, [single]$cropHeight)
+    }
 }
 
 function Render-Composition {
@@ -169,7 +201,7 @@ function Render-Composition {
     $H = [int]$script:CanvasHeight
     $count = [int]$Layers.Count
 
-    # Canvas zones: left ~38% labels, right ~55% tilted process sheets.
+    # Canvas zones: left for labels, right for the tilted layer stack.
     $maxProjectedWidth = [double]$W * 0.456
     $maxProjectedHeight = [double]$H * 0.426
     $availableHeight = [double]$H * 0.875
@@ -178,8 +210,7 @@ function Render-Composition {
         $maxProjectedHeight = [Math]::Max($H * 0.285, [Math]::Min($maxProjectedHeight, $availableHeight - ($count - 1) * $minimumStep))
     }
 
-    # The two basis vectors define one affine parallelogram, shared by every layer.
-    # More horizontal input images produce wider (and shallower) projected sheets.
+    # The two basis vectors define one affine parallelogram shared by every layer.
     $relativeAspect = $AspectRatio / (2.0 / 3.0)
     $rawUX = 820.0 * $relativeAspect
     $rawUY = 310.0 * $relativeAspect
@@ -236,23 +267,22 @@ function Render-Composition {
                 [System.Drawing.PointF]::new([single]($upperLeftX + $ux), [single]($y + $uy)),
                 [System.Drawing.PointF]::new([single]($upperLeftX + $vx), [single]($y + $vy))
             )
-            # A very light sheet silhouette keeps transparent craft exports legible.
-            # This is part of the layer visualization, not a canvas background.
             if ($i -lt $count - 1) {
                 $fourth = [System.Drawing.PointF]::new([single]($upperLeftX + $ux + $vx), [single]($y + $uy + $vy))
                 $outline = [System.Drawing.PointF[]]@($points[0], $points[1], $fourth, $points[2])
                 $graphics.FillPolygon($sheetBrush, $outline)
             }
+
             $img = $null
             $attributes = $null
             try {
                 $img = [System.Drawing.Image]::FromFile($layer.FilePath)
-                $opacity = if ($i -eq $count - 1) { 1.0 } else { 0.46 }
+                if ($i -eq $count - 1) { $opacity = 1.0 } else { $opacity = 0.46 }
                 $matrix = [System.Drawing.Imaging.ColorMatrix]::new()
                 $matrix.Matrix33 = [single]$opacity
                 $attributes = [System.Drawing.Imaging.ImageAttributes]::new()
                 $attributes.SetColorMatrix($matrix)
-                $source = [System.Drawing.RectangleF]::new(0.0, 0.0, [single]$img.Width, [single]$img.Height)
+                $source = Get-CoverSourceRect -ImageWidth $img.Width -ImageHeight $img.Height -TargetAspect $AspectRatio
                 $graphics.DrawImage($img, $points, $source, [System.Drawing.GraphicsUnit]::Pixel, $attributes)
             }
             finally {
@@ -271,9 +301,11 @@ function Render-Composition {
         $format.FormatFlags = [System.Drawing.StringFormatFlags]::NoWrap
         $labelLeft = [single]($W * 0.044)
         $labelMaxWidth = [single]($W * 0.355)
-        $baseFontSize = if ($count -gt 1) {
-            [Math]::Min($H * 0.035, [Math]::Max(28.0, $step * 0.57))
-        } else { $H * 0.035 }
+        if ($count -gt 1) {
+            $baseFontSize = [Math]::Min($H * 0.035, [Math]::Max(28.0, $step * 0.57))
+        } else {
+            $baseFontSize = $H * 0.035
+        }
 
         for ($i = 0; $i -lt $count; $i++) {
             $label = [string]$Layers[$i].Label
@@ -281,6 +313,7 @@ function Render-Composition {
             $font = $null
             try {
                 $size = [double]$baseFontSize
+                $measured = $null
                 while ($true) {
                     if ($null -ne $font) { $font.Dispose() }
                     $font = [System.Drawing.Font]::new('Microsoft YaHei', [single]$size, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
@@ -300,8 +333,6 @@ function Render-Composition {
             }
         }
 
-        # Save to a separate temporary file, then replace the old result.
-        # Deliberately never overwrite an input image or manifest.
         if ([System.IO.File]::Exists($tempPath)) {
             [System.IO.File]::Delete($tempPath)
         }
@@ -331,9 +362,9 @@ try {
     if (-not (Ensure-Manifest -Folder $folder)) { exit 0 }
 
     $layers = @(Read-Layers -Folder $folder)
-    $aspect = Inspect-Layers -Layers $layers
-    Write-Host ("读取完成：{0} 层；最下方底图为：{1}" -f $layers.Count, $layers[-1].FileName)
-    Render-Composition -Layers $layers -AspectRatio $aspect -Folder $folder
+    $baseInfo = Inspect-Layers -Layers $layers
+    Write-Host ("读取完成：{0} 层；底图：{1}（{2}×{3}，作为基准比例）" -f $layers.Count, $baseInfo.BaseFileName, $baseInfo.BaseWidth, $baseInfo.BaseHeight)
+    Render-Composition -Layers $layers -AspectRatio $baseInfo.BaseAspect -Folder $folder
     exit 0
 }
 catch {
