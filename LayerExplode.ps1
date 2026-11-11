@@ -1,11 +1,11 @@
-﻿﻿# LayerExplode v0.0.3
+﻿# LayerExplode v1.0.2
 # Runs on Windows PowerShell 5.1 / Windows 10-11; no external dependencies.
 param(
     [string]$InputDir
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version = 'v0.0.3'
+$script:Version = 'v1.0.2'
 $script:OutputName = 'Exploded_Layers.png'
 $script:ManifestName = 'Layers.txt'
 $script:CanvasWidth = 3840
@@ -52,18 +52,20 @@ function Ensure-Manifest {
 
     $lines = New-Object 'System.Collections.Generic.List[string]'
     $lines.Add('# 从上到下排列 = 从最上面的工艺层到最下面的卡面。')
-    $lines.Add('# 推荐用行首 -> 标记“主图层”（通常是正面成品图）；它决定基准比例。')
-    $lines.Add('# 格式：-> 图片文件名 | 左侧标签    或    图片文件名 | 左侧标签')
-    foreach ($file in $files) {
+    $lines.Add('# 最后一行默认带 > 主图层标记。可直接剪切 / 粘贴这个字符，改选正面主图层。')
+    $lines.Add('# 格式：> 图片文件名 | 左侧标签    或    图片文件名 | 左侧标签')
+    for ($n = 0; $n -lt $files.Count; $n++) {
+        $file = $files[$n]
         $label = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
-        $lines.Add(('{0} | {1}' -f $file.Name, $label))
+        $prefix = if ($n -eq ($files.Count - 1)) { '> ' } else { '' }
+        $lines.Add(('{0}{1} | {2}' -f $prefix, $file.Name, $label))
     }
     $utf8bom = [System.Text.UTF8Encoding]::new($true)
     [System.IO.File]::WriteAllLines($manifest, [string[]]$lines.ToArray(), $utf8bom)
     Write-Host ''
     Write-Host '首次运行：已创建 Layers.txt，并将在记事本中打开。' -ForegroundColor Cyan
-    Write-Host '请调整顺序，并用行首 -> 标记主图层。未标记时默认最后一行为主图层。'
-    Write-Host '常见情况：倒数第二行用 -> 标记正面，最后一行就是背面。'
+    Write-Host '最下面一行已预先带上 > 标记。请调整顺序，并按需把 > 移到正面主图层。'
+    Write-Host '例如：把 > 移到倒数第二行，最后一行便作为完整背面展示。'
     Write-Host "配置文件：$manifest"
     try {
         Start-Process -FilePath 'notepad.exe' -ArgumentList ('"{0}"' -f $manifest) | Out-Null
@@ -97,7 +99,12 @@ function Read-Layers {
         if ($line.Length -eq 0 -or $line.StartsWith('#')) { continue }
 
         $isMain = $false
-        if ($line.StartsWith('->')) {
+        if ($line.StartsWith('>')) {
+            $isMain = $true
+            $line = $line.Substring(1).Trim()
+        }
+        elseif ($line.StartsWith('->')) {
+            # Compatibility with existing Layers.txt files from earlier versions.
             $isMain = $true
             $line = $line.Substring(2).Trim()
         }
@@ -157,7 +164,7 @@ function Read-Layers {
     }
 
     if ($layers.Count -eq 0) { throw 'Layers.txt 没有有效的图层记录。' }
-    if ($mainCount -gt 1) { throw 'Layers.txt 只能有一个主图层（行首箭头）。' }
+    if ($mainCount -gt 1) { throw 'Layers.txt 只能有一个主图层（行首 > 标记）。' }
     if ($mainIndex -lt 0) {
         $mainIndex = $layers.Count - 1
         $layers[$mainIndex].IsMain = $true
@@ -290,6 +297,8 @@ function Render-Composition {
     $graphics = $null
     $brush = $null
     $sheetBrush = $null
+    $edgePen = $null
+    $topEdgePen = $null
     $format = $null
     $tempPath = Join-Path $Folder 'Exploded_Layers.__writing__.png'
     $finalPath = Join-Path $Folder $script:OutputName
@@ -304,7 +313,13 @@ function Render-Composition {
         $graphics.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
         $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
         $graphics.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
-        $sheetBrush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(40, 205, 212, 227))
+        # A neutral sheet acts as a directional filter: an upper sheet dims lower ones.
+        # DrawImage is SourceOver, painted bottom-to-top. Ink and sheet should NOT be
+        # separately flattened onto an opaque temporary background.
+        $sheetBrush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(66, 205, 212, 227))
+        # Fine perimeter edges make the front/back order readable at intersections.
+        $edgePen = [System.Drawing.Pen]::new([System.Drawing.Color]::FromArgb(100, 48, 56, 74), [single]2.4)
+        $topEdgePen = [System.Drawing.Pen]::new([System.Drawing.Color]::FromArgb(100, 244, 247, 251), [single]1.8)
 
         for ($i = $count - 1; $i -ge 0; $i--) {
             $layer = $Layers[$i]
@@ -325,7 +340,7 @@ function Render-Composition {
             $attributes = $null
             try {
                 $img = [System.Drawing.Image]::FromFile($layer.FilePath)
-                $opacity = if ($i -lt $MainIndex) { 0.46 } else { 1.0 }
+                $opacity = if ($i -lt $MainIndex) { 0.68 } else { 1.0 }
                 $matrix = [System.Drawing.Imaging.ColorMatrix]::new()
                 $matrix.Matrix33 = [single]$opacity
                 $attributes = [System.Drawing.Imaging.ImageAttributes]::new()
@@ -336,6 +351,12 @@ function Render-Composition {
             finally {
                 if ($null -ne $attributes) { $attributes.Dispose() }
                 if ($null -ne $img) { $img.Dispose() }
+            }
+            if ($i -lt $MainIndex) {
+                # Occlusion cues must be painted AFTER this layer's image, so that
+                # the next (higher) layer naturally covers the previous outline.
+                $graphics.DrawPolygon($edgePen, $outline)
+                $graphics.DrawLine($topEdgePen, $points[0], $points[1])
             }
             $completed = $count - $i
             $percent = [int][Math]::Round(($completed * 100.0) / $count)
@@ -389,6 +410,8 @@ function Render-Composition {
         if ($null -ne $format) { $format.Dispose() }
         if ($null -ne $brush) { $brush.Dispose() }
         if ($null -ne $sheetBrush) { $sheetBrush.Dispose() }
+        if ($null -ne $edgePen) { $edgePen.Dispose() }
+        if ($null -ne $topEdgePen) { $topEdgePen.Dispose() }
         if ($null -ne $graphics) { $graphics.Dispose() }
         if ($null -ne $bitmap) { $bitmap.Dispose() }
     }
