@@ -1,15 +1,15 @@
-﻿# LayerExplode v0.0.2
+﻿﻿# LayerExplode v0.0.3
 # Runs on Windows PowerShell 5.1 / Windows 10-11; no external dependencies.
 param(
     [string]$InputDir
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version = 'v0.0.2'
+$script:Version = 'v0.0.3'
 $script:OutputName = 'Exploded_Layers.png'
 $script:ManifestName = 'Layers.txt'
 $script:CanvasWidth = 3840
-$script:CanvasHeight = 2160
+$script:CanvasHeight = 3840
 
 function Get-InputFolder {
     param([string]$Requested)
@@ -51,8 +51,9 @@ function Ensure-Manifest {
     }
 
     $lines = New-Object 'System.Collections.Generic.List[string]'
-    $lines.Add('# 从上到下排列 = 图层从上到下；最后一行 = 作为基准比例与底图的正面海报')
-    $lines.Add('# 格式：图片文件名 | 左侧标签。可只写文件名（自动取文件名作为标签）。')
+    $lines.Add('# 从上到下排列 = 从最上面的工艺层到最下面的卡面。')
+    $lines.Add('# 推荐用行首 -> 标记“主图层”（通常是正面成品图）；它决定基准比例。')
+    $lines.Add('# 格式：-> 图片文件名 | 左侧标签    或    图片文件名 | 左侧标签')
     foreach ($file in $files) {
         $label = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
         $lines.Add(('{0} | {1}' -f $file.Name, $label))
@@ -61,7 +62,8 @@ function Ensure-Manifest {
     [System.IO.File]::WriteAllLines($manifest, [string[]]$lines.ToArray(), $utf8bom)
     Write-Host ''
     Write-Host '首次运行：已创建 Layers.txt，并将在记事本中打开。' -ForegroundColor Cyan
-    Write-Host '请把最后一行调整为正面海报（底图）；上层截图尺寸不必一致，程序会按底图比例居中裁切。'
+    Write-Host '请调整顺序，并用行首 -> 标记主图层。未标记时默认最后一行为主图层。'
+    Write-Host '常见情况：倒数第二行用 -> 标记正面，最后一行就是背面。'
     Write-Host "配置文件：$manifest"
     try {
         Start-Process -FilePath 'notepad.exe' -ArgumentList ('"{0}"' -f $manifest) | Out-Null
@@ -86,10 +88,27 @@ function Read-Layers {
     $layers = New-Object 'System.Collections.Generic.List[object]'
     $seen = @{}
     $lineNumber = 0
+    $mainCount = 0
+    $mainIndex = -1
+
     foreach ($raw in $lines) {
         $lineNumber++
         $line = $raw.Trim()
         if ($line.Length -eq 0 -or $line.StartsWith('#')) { continue }
+
+        $isMain = $false
+        if ($line.StartsWith('->')) {
+            $isMain = $true
+            $line = $line.Substring(2).Trim()
+        }
+        elseif ($line.StartsWith('=>')) {
+            $isMain = $true
+            $line = $line.Substring(2).Trim()
+        }
+        elseif ($line.StartsWith('→')) {
+            $isMain = $true
+            $line = $line.Substring(1).Trim()
+        }
 
         $separatorIndex = $line.IndexOf('|')
         if ($separatorIndex -ge 0) {
@@ -100,6 +119,7 @@ function Read-Layers {
             $fileName = $line
             $label = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
         }
+
         if ([string]::IsNullOrWhiteSpace($fileName)) {
             throw "Layers.txt 第 $lineNumber 行缺少图片文件名。"
         }
@@ -120,20 +140,37 @@ function Read-Layers {
         if (-not [System.IO.File]::Exists($fullPath)) {
             throw "找不到图片：$fileName（Layers.txt 第 $lineNumber 行）。"
         }
+
         $layers.Add([pscustomobject]@{
             FileName = $fileName
             FilePath = $fullPath
             Label = $label
             Width = 0
             Height = 0
+            IsMain = $isMain
         })
+
+        if ($isMain) {
+            $mainCount++
+            $mainIndex = $layers.Count - 1
+        }
     }
+
     if ($layers.Count -eq 0) { throw 'Layers.txt 没有有效的图层记录。' }
-    return $layers.ToArray()
+    if ($mainCount -gt 1) { throw 'Layers.txt 只能有一个主图层（行首箭头）。' }
+    if ($mainIndex -lt 0) {
+        $mainIndex = $layers.Count - 1
+        $layers[$mainIndex].IsMain = $true
+    }
+
+    return [pscustomobject]@{
+        Layers = $layers.ToArray()
+        MainIndex = $mainIndex
+    }
 }
 
 function Inspect-Layers {
-    param([object[]]$Layers)
+    param([object[]]$Layers, [int]$MainIndex)
     Add-Type -AssemblyName System.Drawing
 
     foreach ($layer in $Layers) {
@@ -151,10 +188,10 @@ function Inspect-Layers {
         }
     }
 
-    $base = $Layers[-1]
+    $base = $Layers[$MainIndex]
     $aspect = [double]$base.Width / [double]$base.Height
     if ($aspect -le 0.0) {
-        throw "底图比例异常：$($base.FileName)"
+        throw "主图层比例异常：$($base.FileName)"
     }
 
     return [pscustomobject]@{
@@ -178,13 +215,11 @@ function Get-CoverSourceRect {
     }
 
     if ($imageAspect -gt $TargetAspect) {
-        # Too wide: crop left and right.
         $cropWidth = [double]$ImageHeight * $TargetAspect
         $cropX = ([double]$ImageWidth - $cropWidth) / 2.0
         return [System.Drawing.RectangleF]::new([single]$cropX, 0.0, [single]$cropWidth, [single]$ImageHeight)
     }
     else {
-        # Too tall: crop top and bottom.
         $cropHeight = [double]$ImageWidth / $TargetAspect
         $cropY = ([double]$ImageHeight - $cropHeight) / 2.0
         return [System.Drawing.RectangleF]::new(0.0, [single]$cropY, [single]$ImageWidth, [single]$cropHeight)
@@ -194,6 +229,7 @@ function Get-CoverSourceRect {
 function Render-Composition {
     param(
         [object[]]$Layers,
+        [int]$MainIndex,
         [double]$AspectRatio,
         [string]$Folder
     )
@@ -201,42 +237,54 @@ function Render-Composition {
     $H = [int]$script:CanvasHeight
     $count = [int]$Layers.Count
 
-    # Canvas zones: left for labels, right for the tilted layer stack.
-    $maxProjectedWidth = [double]$W * 0.456
-    $maxProjectedHeight = [double]$H * 0.426
-    $availableHeight = [double]$H * 0.875
-    $minimumStep = [double]$H * 0.055
-    if ($count -gt 9) {
-        $maxProjectedHeight = [Math]::Max($H * 0.285, [Math]::Min($maxProjectedHeight, $availableHeight - ($count - 1) * $minimumStep))
-    }
-
-    # The two basis vectors define one affine parallelogram shared by every layer.
+    $maxProjectedWidth = [double]$W * 0.455
+    $maxProjectedHeight = [double]$H * 0.235
+    $availableHeight = [double]$H * 0.86
     $relativeAspect = $AspectRatio / (2.0 / 3.0)
-    $rawUX = 820.0 * $relativeAspect
-    $rawUY = 310.0 * $relativeAspect
-    $rawVX = -940.0
-    $rawVY = 610.0
+
+    $rawUX = 900.0 * $relativeAspect
+    $rawUY = 295.0 * $relativeAspect
+    $rawVX = -1020.0
+    $rawVY = 655.0
     $fit = [Math]::Min($maxProjectedWidth / ($rawUX - $rawVX), $maxProjectedHeight / ($rawUY + $rawVY))
     $ux = [double]$rawUX * $fit
     $uy = [double]$rawUY * $fit
     $vx = [double]$rawVX * $fit
     $vy = [double]$rawVY * $fit
     $sheetHeight = $uy + $vy
-    $sheetWidth = $ux - $vx
 
-    if ($count -gt 1) {
-        $step = [Math]::Min($H * 0.18, ($availableHeight - $sheetHeight) / ($count - 1))
+    $lowerGapUnits = if ($MainIndex -lt $count - 1) { 0.18 } else { 0.0 }
+    $gapUnits = [Math]::Max(0, $count - 1) + $lowerGapUnits
+    if ($gapUnits -gt 0) {
+        $step = [Math]::Min($H * 0.155, ($availableHeight - $sheetHeight) / $gapUnits)
     }
     else {
         $step = 0.0
     }
-    if ($step -lt ($H * 0.043) -and $count -gt 1) {
+    if ($step -lt ($H * 0.075) -and $count -gt 1) {
         Write-Host "提示：$count 层较多，图层和标签可能比较密集。" -ForegroundColor Yellow
     }
-    $totalHeight = $sheetHeight + ($count - 1) * $step
+
+    $positions = New-Object 'System.Collections.Generic.List[double]'
+    $positions.Add(0.0)
+    $currentY = 0.0
+    for ($i = 1; $i -lt $count; $i++) {
+        $gap = $step
+        if (($i - 1) -eq $MainIndex) {
+            $gap = $step * 1.18
+        }
+        $currentY += $gap
+        $positions.Add($currentY)
+    }
+    $totalHeight = $sheetHeight + $currentY
     $startY = ($H - $totalHeight) / 2.0
+
     $centerX = $W * 0.695
     $upperLeftX = $centerX - ($ux + $vx) / 2.0
+    $stackLeft = [double]$upperLeftX + $vx
+    $labelRight = [single]($stackLeft - $W * 0.038)
+    $labelLeftLimit = [single]($W * 0.07)
+    $labelMaxWidth = [single]($W * 0.26)
 
     $bitmap = $null
     $graphics = $null
@@ -258,16 +306,16 @@ function Render-Composition {
         $graphics.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
         $sheetBrush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(40, 205, 212, 227))
 
-        # Paint from the opaque front poster (last TXT line) upward to the first line.
         for ($i = $count - 1; $i -ge 0; $i--) {
             $layer = $Layers[$i]
-            $y = $startY + $step * $i
+            $y = $startY + $positions[$i]
             $points = [System.Drawing.PointF[]]@(
                 [System.Drawing.PointF]::new([single]$upperLeftX, [single]$y),
                 [System.Drawing.PointF]::new([single]($upperLeftX + $ux), [single]($y + $uy)),
                 [System.Drawing.PointF]::new([single]($upperLeftX + $vx), [single]($y + $vy))
             )
-            if ($i -lt $count - 1) {
+
+            if ($i -lt $MainIndex) {
                 $fourth = [System.Drawing.PointF]::new([single]($upperLeftX + $ux + $vx), [single]($y + $uy + $vy))
                 $outline = [System.Drawing.PointF[]]@($points[0], $points[1], $fourth, $points[2])
                 $graphics.FillPolygon($sheetBrush, $outline)
@@ -277,7 +325,7 @@ function Render-Composition {
             $attributes = $null
             try {
                 $img = [System.Drawing.Image]::FromFile($layer.FilePath)
-                if ($i -eq $count - 1) { $opacity = 1.0 } else { $opacity = 0.46 }
+                $opacity = if ($i -lt $MainIndex) { 0.46 } else { 1.0 }
                 $matrix = [System.Drawing.Imaging.ColorMatrix]::new()
                 $matrix.Matrix33 = [single]$opacity
                 $attributes = [System.Drawing.Imaging.ImageAttributes]::new()
@@ -295,16 +343,13 @@ function Render-Composition {
         }
         Write-Host ''
 
-        # Labels: same order and vertical anchors as the corresponding images.
         $brush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 245, 247, 250))
         $format = [System.Drawing.StringFormat]::new()
         $format.FormatFlags = [System.Drawing.StringFormatFlags]::NoWrap
-        $labelLeft = [single]($W * 0.044)
-        $labelMaxWidth = [single]($W * 0.355)
         if ($count -gt 1) {
-            $baseFontSize = [Math]::Min($H * 0.035, [Math]::Max(28.0, $step * 0.57))
+            $baseFontSize = [Math]::Min($H * 0.022, [Math]::Max(34.0, $step * 0.22))
         } else {
-            $baseFontSize = $H * 0.035
+            $baseFontSize = $H * 0.022
         }
 
         for ($i = 0; $i -lt $count; $i++) {
@@ -318,15 +363,17 @@ function Render-Composition {
                     if ($null -ne $font) { $font.Dispose() }
                     $font = [System.Drawing.Font]::new('Microsoft YaHei', [single]$size, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
                     $measured = $graphics.MeasureString($label, $font)
-                    if ($measured.Width -le $labelMaxWidth -or $size -le 25.0) { break }
+                    if ($measured.Width -le $labelMaxWidth -or $size -le 26.0) { break }
                     $size -= 2.0
                 }
                 if ($measured.Width -gt $labelMaxWidth) {
-                    Write-Host "提示：标签过长，可能进入图层区域：$label" -ForegroundColor Yellow
+                    Write-Host "提示：标签过长，可能比较拥挤：$label" -ForegroundColor Yellow
                 }
-                $centerY = $startY + $step * $i + $sheetHeight * 0.52
+                $centerY = $startY + $positions[$i] + $sheetHeight * 0.52
                 $textY = [single]($centerY - $measured.Height / 2.0)
-                $graphics.DrawString($label, $font, $brush, $labelLeft, $textY, $format)
+                $textX = [single]($labelRight - $measured.Width)
+                if ($textX -lt $labelLeftLimit) { $textX = $labelLeftLimit }
+                $graphics.DrawString($label, $font, $brush, $textX, $textY, $format)
             }
             finally {
                 if ($null -ne $font) { $font.Dispose() }
@@ -348,7 +395,7 @@ function Render-Composition {
 
     Move-Item -LiteralPath $tempPath -Destination $finalPath -Force
     Write-Host "生成完成：$finalPath" -ForegroundColor Green
-    Write-Host ("画布：{0}×{1} / 透明 PNG / 图层数：{2}" -f $W, $H, $count)
+    Write-Host ("画布：{0}×{1} / 透明 PNG / 图层数：{2} / 主图层：{3}" -f $W, $H, $count, $Layers[$MainIndex].FileName)
 }
 
 try {
@@ -361,10 +408,12 @@ try {
     Write-Host "素材目录：$folder"
     if (-not (Ensure-Manifest -Folder $folder)) { exit 0 }
 
-    $layers = @(Read-Layers -Folder $folder)
-    $baseInfo = Inspect-Layers -Layers $layers
-    Write-Host ("读取完成：{0} 层；底图：{1}（{2}×{3}，作为基准比例）" -f $layers.Count, $baseInfo.BaseFileName, $baseInfo.BaseWidth, $baseInfo.BaseHeight)
-    Render-Composition -Layers $layers -AspectRatio $baseInfo.BaseAspect -Folder $folder
+    $parsed = Read-Layers -Folder $folder
+    $layers = @($parsed.Layers)
+    $mainIndex = [int]$parsed.MainIndex
+    $baseInfo = Inspect-Layers -Layers $layers -MainIndex $mainIndex
+    Write-Host ("读取完成：{0} 行；主图层：{1}（{2}×{3}，作为基准比例）" -f $layers.Count, $baseInfo.BaseFileName, $baseInfo.BaseWidth, $baseInfo.BaseHeight)
+    Render-Composition -Layers $layers -MainIndex $mainIndex -AspectRatio $baseInfo.BaseAspect -Folder $folder
     exit 0
 }
 catch {
