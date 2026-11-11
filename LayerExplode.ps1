@@ -1,15 +1,62 @@
-﻿# LayerExplode v1.0.2
+﻿# LayerExplode v1.1.0
 # Runs on Windows PowerShell 5.1 / Windows 10-11; no external dependencies.
 param(
     [string]$InputDir
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version = 'v1.0.2'
+$script:Version = 'v1.1.0'
 $script:OutputName = 'Exploded_Layers.png'
 $script:ManifestName = 'Layers.txt'
 $script:CanvasWidth = 3840
 $script:CanvasHeight = 3840
+
+function Read-EnterOrSpace {
+    param([string]$Prompt)
+    Write-Host $Prompt -NoNewline
+    while ($true) {
+        try {
+            $key = [Console]::ReadKey($true)
+        }
+        catch {
+            # Fallback for non-interactive / redirected consoles.
+            Write-Host ''
+            $inputText = Read-Host '请输入后按回车（直接回车=默认；输入空格=编辑/选择）'
+            if ($inputText -match '^\s+$') { return 'Space' }
+            return 'Enter'
+        }
+        if ($key.Key -eq [ConsoleKey]::Enter) {
+            Write-Host ' [回车]'
+            return 'Enter'
+        }
+        if ($key.Key -eq [ConsoleKey]::Spacebar) {
+            Write-Host ' [空格]'
+            return 'Space'
+        }
+    }
+}
+
+function Get-StartupFolder {
+    param([string]$Requested)
+    if (-not [string]::IsNullOrWhiteSpace($Requested)) {
+        # Keep the earlier feature: drag an external folder onto Main.bat.
+        return Get-InputFolder -Requested $Requested
+    }
+
+    $defaultFolder = Join-Path $PSScriptRoot 'i'
+    Write-Host ''
+    Write-Host "默认素材目录：$defaultFolder" -ForegroundColor Cyan
+    $choice = Read-EnterOrSpace -Prompt '回车：使用 i 文件夹    空格：手动选择其它文件夹  '
+    if ($choice -eq 'Space') {
+        return Get-InputFolder -Requested ''
+    }
+
+    if (-not [System.IO.Directory]::Exists($defaultFolder)) {
+        [System.IO.Directory]::CreateDirectory($defaultFolder) | Out-Null
+        Write-Host '已自动创建 i 文件夹。请把素材放进去。' -ForegroundColor Yellow
+    }
+    return (Get-Item -LiteralPath $defaultFolder).FullName
+}
 
 function Get-InputFolder {
     param([string]$Requested)
@@ -38,7 +85,7 @@ function Get-InputFolder {
 function Ensure-Manifest {
     param([string]$Folder)
     $manifest = Join-Path $Folder $script:ManifestName
-    if (Test-Path -LiteralPath $manifest -PathType Leaf) { return $true }
+    if (Test-Path -LiteralPath $manifest -PathType Leaf) { return $false }
 
     $files = @(Get-ChildItem -LiteralPath $Folder -File |
         Where-Object {
@@ -47,12 +94,12 @@ function Ensure-Manifest {
             ($_.Name -ine 'Exploded_Layers.__writing__.png')
         } | Sort-Object Name)
     if ($files.Count -eq 0) {
-        throw '文件夹内没有 PNG/JPG 图片。请先放入素材。'
+        throw '素材目录中没有 PNG/JPG 图片。请先把素材放进 i 文件夹，或在启动时按空格选择其它目录。'
     }
 
     $lines = New-Object 'System.Collections.Generic.List[string]'
     $lines.Add('# 从上到下排列 = 从最上面的工艺层到最下面的卡面。')
-    $lines.Add('# 最后一行默认带 > 主图层标记。可直接剪切 / 粘贴这个字符，改选正面主图层。')
+    $lines.Add('# 最后一行默认带 > 主图层标记。将 > 剪切到正面原图所在行即可。')
     $lines.Add('# 格式：> 图片文件名 | 左侧标签    或    图片文件名 | 左侧标签')
     for ($n = 0; $n -lt $files.Count; $n++) {
         $file = $files[$n]
@@ -62,18 +109,127 @@ function Ensure-Manifest {
     }
     $utf8bom = [System.Text.UTF8Encoding]::new($true)
     [System.IO.File]::WriteAllLines($manifest, [string[]]$lines.ToArray(), $utf8bom)
-    Write-Host ''
-    Write-Host '首次运行：已创建 Layers.txt，并将在记事本中打开。' -ForegroundColor Cyan
-    Write-Host '最下面一行已预先带上 > 标记。请调整顺序，并按需把 > 移到正面主图层。'
-    Write-Host '例如：把 > 移到倒数第二行，最后一行便作为完整背面展示。'
-    Write-Host "配置文件：$manifest"
+    return $true
+}
+
+function Show-ManifestPreview {
+    param([string]$ManifestPath)
+    $utf8strict = [System.Text.UTF8Encoding]::new($false, $true)
     try {
-        Start-Process -FilePath 'notepad.exe' -ArgumentList ('"{0}"' -f $manifest) | Out-Null
+        $allLines = [System.IO.File]::ReadAllLines($ManifestPath, $utf8strict)
     }
     catch {
-        Write-Host '自动打开记事本失败，请手动打开 Layers.txt。' -ForegroundColor Yellow
+        throw '读取 Layers.txt 失败。请使用 UTF-8 保存。'
     }
-    return $false
+    Write-Host ''
+    Write-Host '当前图层信息（从上到下）：' -ForegroundColor Cyan
+    $index = 0
+    foreach ($rawLine in $allLines) {
+        $display = $rawLine.Trim()
+        if ($display.Length -eq 0 -or $display.StartsWith('#')) { continue }
+        $index++
+        if ($display.StartsWith('>') -or $display.StartsWith('->') -or $display.StartsWith('→')) {
+            Write-Host ("  {0,2}. {1}" -f $index, $display) -ForegroundColor Green
+        }
+        else {
+            Write-Host ("  {0,2}. {1}" -f $index, $display)
+        }
+    }
+    if ($index -eq 0) { Write-Host '  （尚无有效记录）' -ForegroundColor Yellow }
+    Write-Host '  行首 > = 主图层；其上是工艺层，其下是完整卡面。' -ForegroundColor DarkGray
+}
+
+function Edit-Manifest {
+    param([string]$ManifestPath)
+    # Native modal editor rather than a Notepad process: Windows 11 Notepad may
+    # reuse an existing tab, where Start-Process -Wait cannot reliably detect
+    # that THIS document has closed. ShowDialog blocks until THIS editor closes.
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $utf8strict = [System.Text.UTF8Encoding]::new($false, $true)
+    $content = [System.IO.File]::ReadAllText($ManifestPath, $utf8strict)
+    $form = [System.Windows.Forms.Form]::new()
+    $editor = [System.Windows.Forms.TextBox]::new()
+    $footer = [System.Windows.Forms.Panel]::new()
+    $hint = [System.Windows.Forms.Label]::new()
+    $done = [System.Windows.Forms.Button]::new()
+    $font = $null
+    try {
+        $form.Text = 'LayerExplode - 编辑 Layers.txt（关闭后继续生成）'
+        $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+        $form.ClientSize = [System.Drawing.Size]::new(1000, 620)
+        $form.MinimumSize = [System.Drawing.Size]::new(680, 430)
+        $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Font
+
+        $font = [System.Drawing.Font]::new('Consolas', [single]12.0)
+        $editor.Multiline = $true
+        $editor.AcceptsReturn = $true
+        $editor.AcceptsTab = $true
+        $editor.ScrollBars = [System.Windows.Forms.ScrollBars]::Both
+        $editor.WordWrap = $false
+        $editor.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $editor.Font = $font
+        $editor.Text = $content
+
+        $footer.Dock = [System.Windows.Forms.DockStyle]::Bottom
+        $footer.Height = 58
+        $hint.Text = '从上到下 = 图层顺序；行首 > = 主图层。关闭窗口自动保存并生成。'
+        $hint.AutoSize = $false
+        $hint.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $hint.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+        $hint.Padding = [System.Windows.Forms.Padding]::new(12, 0, 0, 0)
+        $done.Text = '保存并继续'
+        $done.Width = 130
+        $done.Dock = [System.Windows.Forms.DockStyle]::Right
+        $done.add_Click({ param($sender, $eventArgs) $sender.FindForm().Close() })
+
+        $footer.Controls.Add($hint)
+        $footer.Controls.Add($done)
+        $form.Controls.Add($editor)
+        $form.Controls.Add($footer)
+        $form.Tag = [pscustomobject]@{ Path = $ManifestPath; Editor = $editor }
+
+        $form.add_FormClosing({
+            param($sender, $eventArgs)
+            try {
+                # Ctrl+S or closing with X both persist to the real TXT file.
+                $encoding = [System.Text.UTF8Encoding]::new($true)
+                [System.IO.File]::WriteAllText($sender.Tag.Path, $sender.Tag.Editor.Text, $encoding)
+            }
+            catch {
+                $eventArgs.Cancel = $true
+                [System.Windows.Forms.MessageBox]::Show(
+                    "保存 Layers.txt 失败：$($_.Exception.Message)",
+                    'LayerExplode',
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Error
+                ) | Out-Null
+            }
+        })
+        $editor.add_KeyDown({
+            param($sender, $eventArgs)
+            if ($eventArgs.Control -and $eventArgs.KeyCode -eq [System.Windows.Forms.Keys]::S) {
+                $eventArgs.SuppressKeyPress = $true
+                try {
+                    $data = $sender.FindForm().Tag
+                    [System.IO.File]::WriteAllText($data.Path, $data.Editor.Text, [System.Text.UTF8Encoding]::new($true))
+                }
+                catch {
+                    [System.Windows.Forms.MessageBox]::Show(
+                        "保存 Layers.txt 失败：$($_.Exception.Message)", 'LayerExplode'
+                    ) | Out-Null
+                }
+            }
+        })
+        Write-Host '已打开图层信息编辑窗口。编辑结束后直接关闭或点“保存并继续”。'
+        [void]$form.ShowDialog()
+    }
+    finally {
+        if ($null -ne $font) { $font.Dispose() }
+        $form.Dispose()
+    }
+    Write-Host '编辑窗口已关闭，重新读取最新 Layers.txt。' -ForegroundColor Green
 }
 
 function Read-Layers {
@@ -423,19 +579,37 @@ function Render-Composition {
 
 try {
     Write-Host "LayerExplode $script:Version"
-    $folder = Get-InputFolder -Requested $InputDir
+    $folder = Get-StartupFolder -Requested $InputDir
     if ([string]::IsNullOrEmpty($folder)) {
         Write-Host '已取消。'
         exit 0
     }
     Write-Host "素材目录：$folder"
-    if (-not (Ensure-Manifest -Folder $folder)) { exit 0 }
 
+    $manifestPath = Join-Path $folder $script:ManifestName
+    $newManifest = Ensure-Manifest -Folder $folder
+    if ($newManifest) {
+        Write-Host ''
+        Write-Host '尚无 Layers.txt：已根据图片自动生成清单。' -ForegroundColor Cyan
+        Write-Host '最后一行已带 > 标记。请调整图层顺序和文字，关闭编辑窗口即可继续运行。'
+        Edit-Manifest -ManifestPath $manifestPath
+    }
+    else {
+        Show-ManifestPreview -ManifestPath $manifestPath
+        Write-Host ''
+        $choice = Read-EnterOrSpace -Prompt '回车：直接按当前清单生成    空格：打开清单编辑  '
+        if ($choice -eq 'Space') {
+            Edit-Manifest -ManifestPath $manifestPath
+            Show-ManifestPreview -ManifestPath $manifestPath
+        }
+    }
+
+    # Important: parse only AFTER the editor has fully closed and saved.
     $parsed = Read-Layers -Folder $folder
     $layers = @($parsed.Layers)
     $mainIndex = [int]$parsed.MainIndex
     $baseInfo = Inspect-Layers -Layers $layers -MainIndex $mainIndex
-    Write-Host ("读取完成：{0} 行；主图层：{1}（{2}×{3}，作为基准比例）" -f $layers.Count, $baseInfo.BaseFileName, $baseInfo.BaseWidth, $baseInfo.BaseHeight)
+    Write-Host ("读取完成：{0} 层；主图层：{1}（{2}×{3}，作为基准比例）" -f $layers.Count, $baseInfo.BaseFileName, $baseInfo.BaseWidth, $baseInfo.BaseHeight)
     Render-Composition -Layers $layers -MainIndex $mainIndex -AspectRatio $baseInfo.BaseAspect -Folder $folder
     exit 0
 }
